@@ -16,7 +16,7 @@ app = Flask(__name__)
 # --- Конфигурация ---
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
-RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")  # замени на свой
+RENDER_URL = "https://secretar-041o.onrender.com"
 
 # DeepSeek клиент
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
