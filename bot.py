@@ -12,6 +12,8 @@ import speech_recognition as sr
 from pydub import AudioSegment
 import imageio_ffmpeg
 import os
+ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+AudioSegment.converter = ffmpeg_path
 import google.generativeai as genai
 
 # Настройка логирования
