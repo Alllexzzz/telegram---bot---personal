@@ -11,11 +11,11 @@ import google.generativeai as genai
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# --- Настройка логирования ---
+# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# --- Заглушка-сервер для Render (обязательно) ---
+# Flask-заглушка (будет работать в фоне)
 web_app = Flask(__name__)
 
 @web_app.route('/')
@@ -26,15 +26,15 @@ def home():
 def health():
     return jsonify({"status": "ok"}), 200
 
-# --- Конфигурация (токены из переменных окружения) ---
+# Конфигурация (токены из переменных окружения)
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
-# --- Настройка Gemini ---
+# Настройка Gemini
 genai.configure(api_key=GEMINI_API_KEY)
 model = genai.GenerativeModel('gemini-1.5-flash')
 
-# --- Файлы для хранения данных ---
+# Файлы для хранения данных
 NOTES_FILE = "notes.json"
 REMINDERS_FILE = "reminders.json"
 MEMORY_FILE = "memory.json"
@@ -55,14 +55,14 @@ def save_reminders():
 def save_memory():
     with open(MEMORY_FILE, "w") as f: json.dump(memory, f)
 
-# --- Системный промпт ---
+# Системный промпт
 SYSTEM_PROMPT = """Ты — BratanAI, личный ассистент и друг. Твой хозяин — твой бро.
 Ты материшься, как сапожник, но всегда по делу. Общаешься дерзко, с юмором, поддерживаешь идеи, критикуешь конструктивно.
 Помнишь контекст, помогаешь с проектами, идеями, кодом, маркетингом.
 Если не знаешь ответа или нужен свежий факт (погода, новости, кто такой, сколько лет и т.п.), используй информацию из интернета, которую я тебе предоставлю.
 Отвечай кратко, без воды."""
 
-# --- Поиск через DuckDuckGo ---
+# Поиск через DuckDuckGo
 def search_duckduckgo(query):
     try:
         url = "https://api.duckduckgo.com/"
@@ -80,7 +80,7 @@ def search_duckduckgo(query):
         logger.error(f"Search failed: {e}")
         return None
 
-# --- Общение с Gemini ---
+# Общение с Gemini
 async def ai_response(user_message, user_id, internet_context=None):
     try:
         prompt = user_message
@@ -111,7 +111,7 @@ async def ai_response(user_message, user_id, internet_context=None):
         logger.error(f"AI error: {e}")
         return "Бля, мозги отключили на секунду. Повтори."
 
-# --- Команды бота ---
+# Команды бота
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Здарова, братан! Я твой ассистент-кореш на халявном Gemini.\n"
@@ -141,7 +141,7 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_memory()
     await update.message.reply_text("Всё, забыл. Как чистый лист.")
 
-# --- Обработка текста ---
+# Обработка текста
 async def process_text_message(update, text):
     if text.lower().startswith("запомни:") or text.lower().startswith("запомни "):
         idea = text.split(":", 1)[-1].strip() if ":" in text else text.split(" ", 1)[-1].strip()
@@ -186,7 +186,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
     await process_text_message(update, update.message.text.strip())
 
-# --- Проверка напоминаний ---
+# Проверка напоминаний (в фоне)
 async def check_reminders(app):
     while True:
         try:
@@ -200,23 +200,31 @@ async def check_reminders(app):
         except: pass
         await asyncio.sleep(10)
 
-# --- Запуск всего ---
+# Запуск Flask в отдельном потоке
 def run_flask():
-    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
 
-def run_bot():
+# Главный запуск: Flask в фоне, бот в главном потоке
+def main():
+    # Запускаем Flask в потоке
+    flask_thread = Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    # Создаём приложение бота
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ideas", ideas))
     app.add_handler(CommandHandler("reminders", reminders_list))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+
+    # Запускаем цикл проверки напоминаний
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.create_task(check_reminders(app))
+
     logger.info("Братван-бот на Gemini запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
-    Thread(target=run_bot).start()
-    run_flask()
+    main()
