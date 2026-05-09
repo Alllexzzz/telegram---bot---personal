@@ -10,6 +10,8 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 import speech_recognition as sr
 from pydub import AudioSegment
+import imageio_ffmpeg
+import os
 import google.generativeai as genai
 
 # Настройка логирования
