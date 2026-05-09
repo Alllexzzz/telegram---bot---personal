@@ -32,7 +32,7 @@ GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 
 # Настройка Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-pro')
+model = genai.GenerativeModel('gemini-1.0-pro')
 
 # Файлы для хранения данных
 NOTES_FILE = "notes.json"
