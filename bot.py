@@ -182,37 +182,44 @@ async def reminder_loop(app):
 
 # --- Запуск с webhook ---
 def main():
-    # приложение telegram
     app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
     app_telegram.add_handler(CommandHandler("start", start))
-    app_telegram.add_handler(CommandHandler("ideas", ideas))
+    app_telegram.add_handler(CommandHandler("ideas", ideas_list))
     app_telegram.add_handler(CommandHandler("reminders", reminders_list))
-    app_telegram.add_handler(CommandHandler("clear", clear))
+    app_telegram.add_handler(CommandHandler("clear", clear_context))
     app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Запуск фона напоминаний
+    # --- Обязательная инициализация приложения ---
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    loop.run_until_complete(app_telegram.initialize())
+
+    # Фоновая проверка напоминаний
     loop.create_task(reminder_loop(app_telegram))
 
-    # Настройка webhook
+    # Устанавливаем вебхук
     webhook_url = f"{RENDER_URL}/webhook"
-    print(f"Setting webhook to {webhook_url}")
-    asyncio.get_event_loop().run_until_complete(app_telegram.bot.set_webhook(url=webhook_url))
+    logger.info(f"Устанавливаю webhook: {webhook_url}")
+    loop.run_until_complete(app_telegram.bot.set_webhook(url=webhook_url))
 
-    # Flask-обработчик webhook'а
+    # --- Flask-обработчик (СИНХРОННЫЙ) ---
     @app.route("/webhook", methods=["POST"])
-    async def webhook():
+    def webhook():
         try:
             data = request.get_json()
             update = Update.de_json(data, app_telegram.bot)
-            await app_telegram.process_update(update)
+            # Запускаем асинхронную обработку в текущем event loop
+            future = asyncio.run_coroutine_threadsafe(
+                app_telegram.process_update(update),
+                loop
+            )
+            future.result(timeout=10)
             return "ok", 200
         except Exception as e:
             logger.error(f"Webhook error: {e}")
             return "error", 500
 
-    # Запуск Flask с вебхуком
+    # Запуск Flask
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
 
