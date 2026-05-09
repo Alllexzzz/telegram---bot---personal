@@ -183,6 +183,8 @@ async def process_text_message(update, text):
     await update.message.reply_text(reply)
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
     await update.message.chat.send_action(action="typing")
     await process_text_message(update, update.message.text.strip())
 
