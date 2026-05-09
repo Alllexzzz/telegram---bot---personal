@@ -4,3 +4,4 @@ SpeechRecognition==3.10.0
 pydub==0.25.1
 requests==2.31.0
 pytz==2023.3
+imageio-ffmpeg==0.5.1
