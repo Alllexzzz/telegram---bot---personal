@@ -8,9 +8,9 @@ from datetime import datetime, timedelta
 import pytz
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import openai
 import speech_recognition as sr
 from pydub import AudioSegment
+import google.generativeai as genai
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
@@ -18,10 +18,11 @@ logger = logging.getLogger(__name__)
 
 # Конфигурация из переменных окружения
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
-OPENROUTER_MODEL = "meta-llama/llama-3.1-8b-instruct"  # бесплатно
-openai.api_base = "https://openrouter.ai/api/v1"
-openai.api_key = OPENROUTER_API_KEY
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+
+# Настройка Gemini
+genai.configure(api_key=GEMINI_API_KEY)
+model = genai.GenerativeModel('gemini-1.5-flash')  # бесплатная, быстрая, умная
 
 # Файлы для хранения данных
 NOTES_FILE = "notes.json"
@@ -63,7 +64,7 @@ def save_memory():
 SYSTEM_PROMPT = """Ты — BratanAI, личный ассистент и друг. Твой хозяин — твой бро.
 Ты материшься, как сапожник, но всегда по делу. Общаешься дерзко, с юмором, поддерживаешь идеи, критикуешь конструктивно.
 Помнишь контекст, помогаешь с проектами, идеями, кодом, маркетингом.
-Если не знаешь ответа или нужен свежий факт (погода, новости, кто такой, сколько лет и т.п.), то используй поиск в интернете, который я тебе предоставлю как дополнительный контекст.
+Если не знаешь ответа или нужен свежий факт (погода, новости, кто такой, сколько лет и т.п.), используй информацию из интернета, которую я тебе предоставлю.
 Отвечай кратко, без воды."""
 
 # Функция поиска через DuckDuckGo (бесплатно)
@@ -81,7 +82,6 @@ def search_duckduckgo(query):
         abstract = data.get("AbstractText")
         if abstract:
             return abstract
-        # Если нет Abstract, попробуем взять первый RelatedTopic
         related = data.get("RelatedTopics", [])
         if related:
             for topic in related:
@@ -92,30 +92,39 @@ def search_duckduckgo(query):
         logger.error(f"Search failed: {e}")
         return None
 
-# Функция общения с OpenRouter (мозги)
+# Функция общения с Gemini (мозги)
 async def ai_response(user_message, user_id, internet_context=None):
     try:
-        # Если есть контекст из интернета, подставляем первым сообщением
+        # Если есть контекст из интернета, подставляем
         if internet_context:
-            user_message = f"Информация из интернета: {internet_context}\n\nИсходный вопрос: {user_message}"
+            prompt = f"Информация из интернета: {internet_context}\n\nИсходный вопрос: {user_message}"
+        else:
+            prompt = user_message
 
-        # Сохраняем сообщение в память (последние 10)
+        # Сохраняем сообщение в память
         memory.append({"role": "user", "content": user_message})
         if len(memory) > 10:
             memory.pop(0)
         save_memory()
 
-        messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-        ] + memory[-10:]
+        # Формируем историю для Gemini
+        chat_history = []
+        for msg in memory[-10:]:
+            role = "user" if msg["role"] == "user" else "model"
+            chat_history.append({"role": role, "parts": [msg["content"]]})
 
-        response = openai.ChatCompletion.create(
-            model=OPENROUTER_MODEL,
-            messages=messages,
-            temperature=0.8,
-            max_tokens=600
-        )
-        reply = response.choices[0].message.content
+        # Gemini не поддерживает system prompt в истории, поэтому добавляем его в начало первого сообщения
+        if not chat_history or chat_history[0]["role"] != "user":
+            # Вставляем системный промпт в первое сообщение
+            prompt = SYSTEM_PROMPT + "\n\n" + prompt
+        else:
+            # Объединяем системный промпт с контекстом
+            chat_history[0]["parts"][0] = SYSTEM_PROMPT + "\n\n" + chat_history[0]["parts"][0]
+
+        convo = model.start_chat(history=chat_history)
+        response = convo.send_message(prompt)
+        reply = response.text
+
         memory.append({"role": "assistant", "content": reply})
         if len(memory) > 10:
             memory.pop(0)
@@ -128,24 +137,22 @@ async def ai_response(user_message, user_id, internet_context=None):
 # Обработчик команды /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Здарова, братан! Я твой ассистент-кореш. Могу болтать, запоминать идеи, ставить напоминалки, "
-        "слышать голосовые, смотреть кружочки и даже искать в интернете.\n\n"
+        "Здарова, братан! Я твой ассистент-кореш на халявных мозгах Gemini.\n"
+        "Слышу голосовые, вижу кружочки, ищу в интернете, запоминаю идеи и ставлю напоминалки.\n\n"
         "Команды:\n"
-        "/ideas — показать все запомненные идеи\n"
-        "/reminders — показать активные напоминания\n"
-        "Чтобы запомнить идею: 'запомни: твоя идея'\n"
-        "Чтобы поставить напоминание: 'напомни через 2 часа сделать то-то'\n"
-        "/clear — очистить контекст"
+        "/ideas — все идеи\n"
+        "/reminders — активные напоминания\n"
+        "Чтобы запомнить: 'запомни: твоя идея'\n"
+        "Напоминание: 'напомни через 2 часа сделать то-то'\n"
+        "/clear — забыть контекст"
     )
 
 # Обработчик идей
 async def ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not notes:
-        await update.message.reply_text("Идей пока нет, братан. Накидай чего-нибудь.")
+        await update.message.reply_text("Идей пока нет, братан.")
     else:
-        msg = "📌 Твои идеи:\n"
-        for i, note in enumerate(notes, 1):
-            msg += f"{i}. {note}\n"
+        msg = "📌 Твои идеи:\n" + "\n".join(f"{i}. {n}" for i, n in enumerate(notes, 1))
         await update.message.reply_text(msg)
 
 # Обработчик напоминаний
@@ -166,13 +173,12 @@ async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global memory
     memory = []
     save_memory()
-    await update.message.reply_text("Понял, всё забыл. Как чистый лист.")
+    await update.message.reply_text("Всё, забыл. Как чистый лист.")
 
-# Распознавание речи из аудиофайла (голосовые и кружочки)
+# Распознавание речи из аудиофайла
 def transcribe_audio(file_path):
     recognizer = sr.Recognizer()
     try:
-        # Конвертируем ogg в wav
         audio = AudioSegment.from_ogg(file_path)
         wav_data = io.BytesIO()
         audio.export(wav_data, format="wav")
@@ -190,13 +196,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
     voice = update.message.voice
     file = await context.bot.get_file(voice.file_id)
-    # Скачиваем во временный файл
     await file.download_to_drive("voice.ogg")
     text = transcribe_audio("voice.ogg")
     if not text:
-        await update.message.reply_text("Не расслышал, братан. Повтори громче или текстом.")
+        await update.message.reply_text("Не расслышал, братан. Повтори.")
         return
-    # Дальше обрабатываем как текстовое сообщение
     await process_text_message(update, text)
 
 # Обработчик видеосообщений (кружочков)
@@ -205,22 +209,21 @@ async def handle_video_note(update: Update, context: ContextTypes.DEFAULT_TYPE):
     video_note = update.message.video_note
     file = await context.bot.get_file(video_note.file_id)
     await file.download_to_drive("circle.mp4")
-    # Извлекаем аудиодорожку из mp4 в ogg
     try:
         audio = AudioSegment.from_file("circle.mp4", format="mp4")
         audio.export("circle.ogg", format="ogg")
         text = transcribe_audio("circle.ogg")
     except Exception as e:
-        logger.error(f"Circle video extraction error: {e}")
+        logger.error(f"Circle error: {e}")
         text = None
     if not text:
         await update.message.reply_text("В кружочке не разобрал речь, сорян.")
         return
     await process_text_message(update, text)
 
-# Общая функция обработки текста (используется после распознавания)
+# Общая функция обработки текста
 async def process_text_message(update, text):
-    # Проверка на команду "запомни"
+    # Запомни
     if text.lower().startswith("запомни:") or text.lower().startswith("запомни "):
         idea = text.split(":", 1)[-1].strip() if ":" in text else text.split(" ", 1)[-1].strip()
         notes.append(idea)
@@ -228,7 +231,7 @@ async def process_text_message(update, text):
         await update.message.reply_text(f"Сохранил, бро: «{idea}»")
         return
 
-    # Проверка на команду "напомни"
+    # Напомни
     if text.lower().startswith("напомни"):
         try:
             if "через" in text:
@@ -248,7 +251,6 @@ async def process_text_message(update, text):
                     delta = timedelta(minutes=amount)
                 remind_time = now + delta
             else:
-                # Формат: напомни ДД.ММ.ГГГГ в ЧЧ:ММ текст
                 text_without_command = text.split(" ", 1)[1]
                 date_part = text_without_command.split(" в ")[0]
                 time_part = text_without_command.split(" в ")[1][:5]
@@ -266,13 +268,12 @@ async def process_text_message(update, text):
             await update.message.reply_text("Не понял время. Пример: 'напомни через 30 минут проверить почту'")
         return
 
-    # Определяем, нужен ли поиск в интернете (простые вопросительные слова)
+    # Поиск в интернете при необходимости
     search_keywords = ["погода", "сколько лет", "кто такой", "что такое", "где ", "когда ", "почему", "зачем", "какой ", "какая ", "какие ", "новости", "курс ", "сколько стоит"]
     internet_context = None
     if any(q in text.lower() for q in search_keywords):
         internet_context = search_duckduckgo(text)
 
-    # Отправляем в AI с возможным контекстом из интернета
     reply = await ai_response(text, update.effective_user.id, internet_context)
     await update.message.reply_text(reply)
 
@@ -281,7 +282,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action(action="typing")
     await process_text_message(update, update.message.text.strip())
 
-# Фоновая задача проверки напоминаний
+# Фоновая проверка напоминаний
 async def check_reminders(app):
     while True:
         try:
@@ -299,28 +300,22 @@ async def check_reminders(app):
             logger.error(f"Reminder loop error: {e}")
         await asyncio.sleep(10)
 
-# Запуск приложения
+# Запуск
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # Команды
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("ideas", ideas))
     app.add_handler(CommandHandler("reminders", reminders_list))
     app.add_handler(CommandHandler("clear", clear))
-
-    # Голосовые сообщения
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
-    # Кружочки (видеосообщения)
     app.add_handler(MessageHandler(filters.VIDEO_NOTE, handle_video_note))
-    # Обычные текстовые сообщения (не команды)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Запуск проверки напоминаний
     loop = asyncio.get_event_loop()
     loop.create_task(check_reminders(app))
 
-    logger.info("Братван-бот с поиском, голосовыми и кружочками запущен!")
+    logger.info("Братван-бот на Gemini запущен!")
     app.run_polling()
 
 if __name__ == "__main__":
