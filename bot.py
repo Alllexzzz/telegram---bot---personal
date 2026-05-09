@@ -1,162 +1,136 @@
-import os
-import json
-import asyncio
-import logging
-import requests
+import os, json, asyncio, logging, requests
 from datetime import datetime, timedelta
 import pytz
-from threading import Thread
-from flask import Flask, jsonify
-import google.generativeai as genai
+from flask import Flask, request, jsonify
+from openai import OpenAI
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 
-# Настройка логирования
+# --- Логи ---
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Flask-заглушка (будет работать в фоне)
-web_app = Flask(__name__)
+# --- Flask-сервер ---
+app = Flask(__name__)
 
-@web_app.route('/')
-def home():
-    return "Братван-бот жив. Курим бамбук."
-
-@web_app.route('/health')
-def health():
-    return jsonify({"status": "ok"}), 200
-
-# Конфигурация (токены из переменных окружения)
+# --- Конфигурация ---
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
+DEEPSEEK_API_KEY = os.environ["DEEPSEEK_API_KEY"]
+RENDER_URL = os.environ.get("RENDER_EXTERNAL_URL", "https://your-app.onrender.com")  # замени на свой
 
-# Настройка Gemini
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.0-pro')
+# DeepSeek клиент
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+MODEL = "deepseek-chat"  # или deepseek-coder
 
-# Файлы для хранения данных
-NOTES_FILE = "notes.json"
-REMINDERS_FILE = "reminders.json"
-MEMORY_FILE = "memory.json"
-
+# --- Хранилище ---
+NOTES_FILE, REMINDERS_FILE, MEMORY_FILE = "notes.json", "reminders.json", "memory.json"
 notes, reminders, memory = [], [], []
+for fname, lst in ((NOTES_FILE, notes), (REMINDERS_FILE, reminders), (MEMORY_FILE, memory)):
+    if os.path.exists(fname):
+        with open(fname, "r") as f: lst.extend(json.load(f))
 
-if os.path.exists(NOTES_FILE):
-    with open(NOTES_FILE, "r") as f: notes = json.load(f)
-if os.path.exists(REMINDERS_FILE):
-    with open(REMINDERS_FILE, "r") as f: reminders = json.load(f)
-if os.path.exists(MEMORY_FILE):
-    with open(MEMORY_FILE, "r") as f: memory = json.load(f)
+def save(lst, fname):
+    with open(fname, "w") as f: json.dump(lst, f)
 
-def save_notes():
-    with open(NOTES_FILE, "w") as f: json.dump(notes, f)
-def save_reminders():
-    with open(REMINDERS_FILE, "w") as f: json.dump(reminders, f)
-def save_memory():
-    with open(MEMORY_FILE, "w") as f: json.dump(memory, f)
-
-# Системный промпт
 SYSTEM_PROMPT = """Ты — BratanAI, личный ассистент и друг. Твой хозяин — твой бро.
 Ты материшься, как сапожник, но всегда по делу. Общаешься дерзко, с юмором, поддерживаешь идеи, критикуешь конструктивно.
 Помнишь контекст, помогаешь с проектами, идеями, кодом, маркетингом.
-Если не знаешь ответа или нужен свежий факт (погода, новости, кто такой, сколько лет и т.п.), используй информацию из интернета, которую я тебе предоставлю.
+Если нужен факт (погода, новости, кто такой, сколько лет), используй информацию из интернета, которую я передам.
 Отвечай кратко, без воды."""
 
-# Поиск через DuckDuckGo
+# --- DuckDuckGo поиск ---
 def search_duckduckgo(query):
     try:
-        url = "https://api.duckduckgo.com/"
-        params = {"q": query, "format": "json", "no_html": 1, "skip_disambig": 1}
-        response = requests.get(url, params=params, timeout=5)
-        data = response.json()
-        abstract = data.get("AbstractText")
-        if abstract: return abstract
-        related = data.get("RelatedTopics", [])
-        if related:
-            for t in related:
-                if "Text" in t: return t["Text"]
+        r = requests.get("https://api.duckduckgo.com/",
+                         params={"q": query, "format": "json", "no_html": 1, "skip_disambig": 1},
+                         timeout=5)
+        data = r.json()
+        if data.get("AbstractText"):
+            return data["AbstractText"]
+        for t in data.get("RelatedTopics", []):
+            if "Text" in t: return t["Text"]
         return None
     except Exception as e:
-        logger.error(f"Search failed: {e}")
+        logger.error(f"Search error: {e}")
         return None
 
-# Общение с Gemini
+# --- AI-ответ через DeepSeek ---
 async def ai_response(user_message, user_id, internet_context=None):
     try:
         prompt = user_message
         if internet_context:
-            prompt = f"Информация из интернета: {internet_context}\n\nИсходный вопрос: {user_message}"
+            prompt = f"Информация из интернета: {internet_context}\n\nВопрос: {user_message}"
 
         memory.append({"role": "user", "content": user_message})
         if len(memory) > 10: memory.pop(0)
-        save_memory()
+        save(memory, MEMORY_FILE)
 
-        chat_history = []
-        for msg in memory[-10:]:
-            role = "user" if msg["role"] == "user" else "model"
-            chat_history.append({"role": role, "parts": [msg["content"]]})
+        messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+        for m in memory[-10:]:
+            role = m["role"] if m["role"] == "user" else "assistant"
+            messages.append({"role": role, "content": m["content"]})
+        messages.append({"role": "user", "content": prompt})
 
-        if chat_history and chat_history[0]["role"] == "user":
-            chat_history[0]["parts"][0] = SYSTEM_PROMPT + "\n\n" + chat_history[0]["parts"][0]
-
-        convo = model.start_chat(history=chat_history)
-        response = convo.send_message(prompt)
-        reply = response.text
+        response = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0.8,
+            max_tokens=600
+        )
+        reply = response.choices[0].message.content
 
         memory.append({"role": "assistant", "content": reply})
         if len(memory) > 10: memory.pop(0)
-        save_memory()
+        save(memory, MEMORY_FILE)
         return reply
     except Exception as e:
         logger.error(f"AI error: {e}")
         return "Бля, мозги отключили на секунду. Повтори."
 
-# Команды бота
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Здарова, братан! Я твой ассистент-кореш на халявном Gemini.\n"
-        "Ищу в интернете, запоминаю идеи, ставлю напоминалки.\n\n"
-        "Команды:\n/ideas — все идеи\n/reminders — активные напоминания\n"
-        "Запомнить: 'запомни: идея'\nНапомнить: 'напомни через 2 часа сделать'\n/clear — забыть контекст"
-    )
+# --- Обработчики Telegram (без изменений, но в webhook) ---
+# (код дальше без правок, только register_handlers)
+async def start(update, context):
+    await update.message.reply_text("Здарова! Я ассистент на DeepSeek. Команды: /ideas, /reminders, /clear.\nЗапомнить: 'запомни: ...'\nНапомнить: 'напомни через 30 мин ...")
 
-async def ideas(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not notes: await update.message.reply_text("Идей пока нет, братан.")
+async def ideas(update, context):
+    if not notes:
+        await update.message.reply_text("Идей нет.")
     else:
-        msg = "📌 Твои идеи:\n" + "\n".join(f"{i}. {n}" for i, n in enumerate(notes, 1))
+        msg = "📌 Идеи:\n" + "\n".join(f"{i}. {n}" for i,n in enumerate(notes,1))
         await update.message.reply_text(msg)
 
-async def reminders_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not reminders: await update.message.reply_text("Напоминалок нет.")
+async def reminders_list(update, context):
+    if not reminders:
+        await update.message.reply_text("Напоминалок нет.")
     else:
-        msg, now = "⏰ Активные напоминания:\n", datetime.now(pytz.utc)
+        now = datetime.now(pytz.utc)
+        msg = "⏰ Напоминания:\n"
         for r in reminders:
-            rt = datetime.fromisoformat(r["time"])
-            if rt > now: msg += f"• {r['text']} (в {rt.strftime('%d.%m.%Y %H:%M')})\n"
+            dt = datetime.fromisoformat(r["time"])
+            if dt > now:
+                msg += f"• {r['text']} (в {dt.strftime('%d.%m.%Y %H:%M')})\n"
         await update.message.reply_text(msg)
 
-async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global memory
-    memory = []
-    save_memory()
-    await update.message.reply_text("Всё, забыл. Как чистый лист.")
+async def clear(update, context):
+    memory.clear()
+    save(memory, MEMORY_FILE)
+    await update.message.reply_text("Контекст очищен.")
 
-# Обработка текста
-async def process_text_message(update, text):
-    if text.lower().startswith("запомни:") or text.lower().startswith("запомни "):
-        idea = text.split(":", 1)[-1].strip() if ":" in text else text.split(" ", 1)[-1].strip()
+async def process_text(update, text):
+    if text.lower().startswith(("запомни:", "запомни ")):
+        idea = text.split(":",1)[-1].strip() if ":" in text else text[8:].strip()
         notes.append(idea)
-        save_notes()
-        await update.message.reply_text(f"Сохранил, бро: «{idea}»")
+        save(notes, NOTES_FILE)
+        await update.message.reply_text(f"Сохранено: {idea}")
         return
     if text.lower().startswith("напомни"):
         try:
             if "через" in text:
-                parts = text.lower().split("через", 1)[1].strip()
+                parts = text.lower().split("через",1)[1].strip()
                 words = parts.split()
                 amount = int(words[0])
-                unit = words[1] if len(words) > 1 else "минут"
-                reminder_text = " ".join(words[2:]) if len(words) > 2 else "что-то сделать"
+                unit = words[1] if len(words)>1 else "минут"
+                reminder_text = " ".join(words[2:]) if len(words)>2 else "что-то сделать"
                 now = datetime.now(pytz.utc)
                 if "минут" in unit: delta = timedelta(minutes=amount)
                 elif "час" in unit: delta = timedelta(hours=amount)
@@ -164,69 +138,83 @@ async def process_text_message(update, text):
                 else: delta = timedelta(minutes=amount)
                 remind_time = now + delta
             else:
-                t = text.split(" ", 1)[1]
-                dp, tp = t.split(" в ")[0], t.split(" в ")[1][:5]
+                t = text.split(" ",1)[1]
+                date_part = t.split(" в ")[0]
+                time_part = t.split(" в ")[1][:5]
                 reminder_text = t.split(" в ")[1][5:].strip()
-                remind_time = datetime.strptime(f"{dp} {tp}", "%d.%m.%Y %H:%M")
+                remind_time = datetime.strptime(f"{date_part} {time_part}", "%d.%m.%Y %H:%M")
                 remind_time = pytz.utc.localize(remind_time)
             reminders.append({"chat_id": update.effective_chat.id, "text": reminder_text, "time": remind_time.isoformat()})
-            save_reminders()
-            await update.message.reply_text(f"Понял, напомню в {remind_time.strftime('%d.%m.%Y %H:%M')}: «{reminder_text}»")
-        except: await update.message.reply_text("Не понял время. Пример: 'напомни через 30 минут проверить почту'")
+            save(reminders, REMINDERS_FILE)
+            await update.message.reply_text(f"Напомню в {remind_time.strftime('%d.%m.%Y %H:%M')}: {reminder_text}")
+        except:
+            await update.message.reply_text("Формат: напомни через 30 минут сделать звонок")
         return
 
-    search_kw = ["погода", "сколько лет", "кто такой", "что такое", "где ", "когда ", "почему", "зачем", "какой ", "какая ", "какие ", "новости", "курс ", "сколько стоит"]
+    # поиск в интернете при вопросительных словах
     ctx = None
-    if any(q in text.lower() for q in search_kw): ctx = search_duckduckgo(text)
+    keywords = ["погода","сколько лет","кто такой","что такое","где ","когда ","почему","зачем","какой ","какая ","какие ","новости","курс ","сколько стоит"]
+    if any(k in text.lower() for k in keywords):
+        ctx = search_duckduckgo(text)
 
     reply = await ai_response(text, update.effective_user.id, ctx)
     await update.message.reply_text(reply)
 
-async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
-    await update.message.chat.send_action(action="typing")
-    await process_text_message(update, update.message.text.strip())
+async def handle_text(update, context):
+    if not update.message: return
+    await update.message.chat.send_action("typing")
+    await process_text(update, update.message.text.strip())
 
-# Проверка напоминаний (в фоне)
-async def check_reminders(app):
+# --- Фоновая проверка напоминаний (работает и с webhook) ---
+async def reminder_loop(app):
     while True:
         try:
             now = datetime.now(pytz.utc)
             for r in reminders[:]:
                 if datetime.fromisoformat(r["time"]) <= now:
-                    try: await app.bot.send_message(chat_id=r["chat_id"], text=f"⏰ Напоминаю: {r['text']}")
+                    try:
+                        await app.bot.send_message(chat_id=r["chat_id"], text=f"⏰ Напоминаю: {r['text']}")
                     except: pass
                     reminders.remove(r)
-                    save_reminders()
+                    save(reminders, REMINDERS_FILE)
         except: pass
         await asyncio.sleep(10)
 
-# Запуск Flask в отдельном потоке
-def run_flask():
-    web_app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
-
-# Главный запуск: Flask в фоне, бот в главном потоке
+# --- Запуск с webhook ---
 def main():
-    # Запускаем Flask в потоке
-    flask_thread = Thread(target=run_flask, daemon=True)
-    flask_thread.start()
+    # приложение telegram
+    app_telegram = Application.builder().token(TELEGRAM_TOKEN).build()
+    app_telegram.add_handler(CommandHandler("start", start))
+    app_telegram.add_handler(CommandHandler("ideas", ideas))
+    app_telegram.add_handler(CommandHandler("reminders", reminders_list))
+    app_telegram.add_handler(CommandHandler("clear", clear))
+    app_telegram.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
 
-    # Создаём приложение бота
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("ideas", ideas))
-    app.add_handler(CommandHandler("reminders", reminders_list))
-    app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-
-    # Запускаем цикл проверки напоминаний
+    # Запуск фона напоминаний
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    loop.create_task(check_reminders(app))
+    loop.create_task(reminder_loop(app_telegram))
 
-    logger.info("Братван-бот на Gemini запущен!")
-    app.run_polling()
+    # Настройка webhook
+    webhook_url = f"{RENDER_URL}/webhook"
+    print(f"Setting webhook to {webhook_url}")
+    asyncio.get_event_loop().run_until_complete(app_telegram.bot.set_webhook(url=webhook_url))
+
+    # Flask-обработчик webhook'а
+    @app.route("/webhook", methods=["POST"])
+    async def webhook():
+        try:
+            data = request.get_json()
+            update = Update.de_json(data, app_telegram.bot)
+            await app_telegram.process_update(update)
+            return "ok", 200
+        except Exception as e:
+            logger.error(f"Webhook error: {e}")
+            return "error", 500
+
+    # Запуск Flask с вебхуком
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
     main()
